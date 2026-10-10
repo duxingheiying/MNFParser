@@ -1,6 +1,6 @@
 # MNFParser
 
-C++17/CMake parser tailored to the supplied `swing_arm_0.mnf`.
+C++17/CMake parser tailored to the supplied 
 
 ## Features
 - Big-endian binary reader
