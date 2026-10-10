@@ -28,7 +28,7 @@ cmake --build build -j
 
 ## Run
 ```powershell
-build\Release\mnf_parser.exe swing_arm_0.mnf output
+build\Release\mnf_parser.exe xxx.mnf output
 ```
 
 The current offsets/counts are specific to the supplied file and are not
