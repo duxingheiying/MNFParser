@@ -1,6 +1,6 @@
 # MNFParser (updated topology support)
 
-C++17 / CMake sample parser tailored to the supplied `swing_arm_0.mnf`.
+C++17/CMake parser tailored to the supplied `xxx.mnf`.
 
 ## Topology additions
 The parser now reads mixed connectivity records (`vertexCount` followed by indices):
@@ -21,7 +21,7 @@ cmake --build build --config Release
 
 ## Run
 ```powershell
-build\\Release\\mnf_parser.exe swing_arm_0.mnf output
+build\Release\mnf_parser.exe xxx.mnf output
 ```
 
 Output files: `model.obj`, `nodes_.csv`, `modes_.csv`.
