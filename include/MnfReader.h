@@ -18,6 +18,7 @@ private:
     bool parseBodyProperties();
     bool parseModes();
     bool parseTopology();
+    bool parseEdgeLines();
 
     std::string filename_;
     BigEndianReader reader_;
