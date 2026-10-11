@@ -22,7 +22,7 @@ public:
 	void readBytes(void* dst, size_t size);
 
 private:
-	std::string filename_;
-	std::ifstream file_;
-	uint64_t size_ = 0;
+	std::string m_filename;
+	std::ifstream m_file;
+	uint64_t m_size = 0;
 };

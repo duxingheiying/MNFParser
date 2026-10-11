@@ -1,50 +1,45 @@
 #pragma once
 #include <cstdint>
 #include <vector>
+#include <string>
 
 struct MnfNode {
-    uint32_t id = 0;
-    double x = 0.0, y = 0.0, z = 0.0;
+	uint32_t id = 0;
+	double x = 0.0, y = 0.0, z = 0.0;
 };
 
-struct MnfLine {
-    uint32_t count = 2;
-    uint32_t v0 = 0, v1 = 0;
-};
-
-struct MnfTriangle {
-    uint32_t count = 3;
-    uint32_t v0 = 0, v1 = 0, v2 = 0;
-};
-
-struct MnfQuad {
-    uint32_t count = 4;
-    uint32_t v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+// Generic connectivity record. vertexCount determines whether it is a line,
+// triangle, quad, or another polygon type.
+struct MnfElement {
+	std::vector<uint32_t> indices;
 };
 
 struct MnfMode {
-    uint32_t id = 0;
-    double value0 = 0.0, value1 = 0.0, value2 = 0.0;
-    double value3 = 0.0, value4 = 0.0;
+	uint32_t id = 0;
+	double values[5] = {};
 };
 
-struct MnfBodyProperties {
-    double values[13] = {};
+struct MnfDataBlock {
+	std::string kind;
+	uint64_t offset = 0;
+	uint64_t byteSize = 0;
+	uint64_t recordCount = 0;
 };
 
 struct MnfDocument {
-    uint64_t fileSize_ = 0;
-    bool bigEndian_ = true;
-    std::vector<MnfNode> nodes_;
-    MnfBodyProperties body_;
-    uint32_t modeCount_ = 0;
-    std::vector<MnfMode> modes_;
+	uint64_t fileSize = 0;
+	bool bigEndian = true;
+	uint64_t nodeBlockOffset = 0;
+	uint64_t topologyBlockOffset = 0;
+	uint64_t topologyBlockEnd = 0;
+	std::vector<MnfNode> nodes;
+	std::vector<MnfElement> elements;
+	std::vector<MnfMode> modes;
+	std::vector<MnfDataBlock> detectedBlocks;
+	std::vector<uint8_t> fileBytes;
 
-    // Mixed element-connectivity block.
-    std::vector<MnfLine> lines_;
-    std::vector<MnfTriangle> triangles_;
-    std::vector<MnfQuad> quads_;
-
-    // A second line/edge block found near the end of the supplied file.
-    std::vector<MnfLine> edgeLines_;
+	size_t lineCount() const;
+	size_t triangleCount() const;
+	size_t quadCount() const;
+	size_t polygonCount() const;
 };

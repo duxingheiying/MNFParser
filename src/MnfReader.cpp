@@ -1,231 +1,253 @@
 #include "MnfReader.h"
+#include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <iterator>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <sstream>
 
 namespace {
-bool validDouble(double v) { return std::isfinite(v) && std::abs(v) < 1.0e12; }
+	uint32_t u32be(const std::vector<uint8_t>& b, size_t p) {
+		return (uint32_t(b[p]) << 24) | (uint32_t(b[p + 1]) << 16) |
+			(uint32_t(b[p + 2]) << 8) | uint32_t(b[p + 3]);
+	}
+	double f64be(const std::vector<uint8_t>& b, size_t p) {
+		uint64_t bits = 0;
+		for (int i = 0; i < 8; ++i) bits = (bits << 8) | b[p + i];
+		double value;
+		static_assert(sizeof(value) == sizeof(bits), "Unexpected double size");
+		std::memcpy(&value, &bits, sizeof(value));
+		return value;
+	}
+	bool plausibleDouble(double x) {
+		return std::isfinite(x) && std::abs(x) < 1.0e12;
+	}
+	bool plausibleCoordinate(double x) {
+		return std::isfinite(x) && std::abs(x) < 1.0e9;
+	}
+	struct NodeCandidate { size_t offset = 0, count = 0; };
+	struct TopologyCandidate { size_t offset = 0, end = 0, count = 0; };
+	struct ModeCandidate { size_t offset = 0, count = 0; };
 }
 
-MnfReader::MnfReader(const std::string& filename) : filename_(filename), reader_(filename) {}
+size_t MnfDocument::lineCount() const {
+	return static_cast<size_t>(std::count_if(elements.begin(), elements.end(), [](const MnfElement& e) { return e.indices.size() == 2; }));
+}
+size_t MnfDocument::triangleCount() const {
+	return static_cast<size_t>(std::count_if(elements.begin(), elements.end(), [](const MnfElement& e) { return e.indices.size() == 3; }));
+}
+size_t MnfDocument::quadCount() const {
+	return static_cast<size_t>(std::count_if(elements.begin(), elements.end(), [](const MnfElement& e) { return e.indices.size() == 4; }));
+}
+size_t MnfDocument::polygonCount() const {
+	return static_cast<size_t>(std::count_if(elements.begin(), elements.end(), [](const MnfElement& e) { return e.indices.size() > 4; }));
+}
+
+MnfReader::MnfReader(const std::string& filename) : m_filename(filename) {}
 
 bool MnfReader::load() {
-    if (!reader_.open()) {
-        std::cerr << "Cannot open MNF file: " << filename_ << '\n';
-        return false;
-    }
-    document_ = {};
-    document_.fileSize_ = reader_.size();
-    return parseNodes() && parseBodyProperties() && parseModes() &&
-           parseTopology() && parseEdgeLines();
+	std::ifstream in(m_filename, std::ios::binary);
+	if (!in) {
+		std::cerr << "Cannot open MNF file: " << m_filename << '\n';
+		return false;
+	}
+	m_document = {};
+	m_document.fileBytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+	m_document.fileSize = m_document.fileBytes.size();
+	if (m_document.fileBytes.size() < 64) {
+		std::cerr << "File is too small to be a valid MNF file.\n";
+		return false;
+	}
+	if (!detectNodes()) {
+		std::cerr << "Could not reliably identify a node-coordinate block. The file may use a different MNF variant.\n";
+		return false;
+	}
+	if (!detectTopology()) {
+		std::cerr << "Could not reliably identify a connectivity block.\n";
+		return false;
+	}
+	detectModes(); // Optional heuristic; failure does not invalidate geometry.
+	return true;
 }
 
-const MnfDocument& MnfReader::document() const { return document_; }
+const MnfDocument& MnfReader::document() const { return m_document; }
 
-bool MnfReader::parseNodes() {
-    // These node-section offsets/counts are specific to the supplied file.
-    constexpr uint64_t NODE_OFFSET = 3176;
-    constexpr uint32_t NODE_COUNT = 12054;
-    reader_.seek(NODE_OFFSET);
-    document_.nodes_.reserve(NODE_COUNT);
+bool MnfReader::detectNodes() {
+	const auto& b = m_document.fileBytes;
+	constexpr size_t stride = 28; // uint32 ID + three IEEE-754 doubles
+	NodeCandidate best;
 
-    for (uint32_t i = 0; i < NODE_COUNT; ++i) {
-        MnfNode n;
-        n.id = reader_.readU32();
-        n.x = reader_.readDouble();
-        n.y = reader_.readDouble();
-        n.z = reader_.readDouble();
-        if (!validDouble(n.x) || !validDouble(n.y) || !validDouble(n.z)) {
-            std::cerr << "Invalid node at index " << i << '\n';
-            return false;
-        }
-        document_.nodes_.push_back(n);
-    }
-    return true;
+	// Search every 4-byte-aligned candidate. A node block is accepted only if
+	// node IDs form a consecutive run and all coordinates are finite/plausible.
+	for (size_t off = 0; off + stride <= b.size(); off += 4) {
+		const uint32_t firstId = u32be(b, off);
+		if (firstId == 0) continue;
+		size_t count = 0;
+		uint32_t prevId = firstId;
+		size_t p = off;
+		while (p + stride <= b.size()) {
+			const uint32_t id = u32be(b, p);
+			const double x = f64be(b, p + 4), y = f64be(b, p + 12), z = f64be(b, p + 20);
+			if (id == 0 || (count > 0 && id <= prevId) ||
+				!plausibleCoordinate(x) || !plausibleCoordinate(y) || !plausibleCoordinate(z)) break;
+			++count; prevId = id; p += stride;
+		}
+		if (count > best.count) best = { off, count };
+		if (count >= 8) off = ((p - 1) / 4) * 4;
+	}
+	if (best.count < 8) return false;
+	m_document.nodeBlockOffset = best.offset;
+	m_document.nodes.reserve(best.count);
+	for (size_t i = 0, p = best.offset; i < best.count; ++i, p += stride) {
+		MnfNode n;
+		n.id = u32be(b, p);
+		n.x = f64be(b, p + 4); n.y = f64be(b, p + 12); n.z = f64be(b, p + 20);
+		m_document.nodes.push_back(n);
+	}
+	m_document.detectedBlocks.push_back({ "nodes", best.offset, best.count * stride, best.count });
+	return true;
 }
 
-bool MnfReader::parseBodyProperties() {
-    constexpr uint64_t BODY_OFFSET = 340688;
-    reader_.seek(BODY_OFFSET);
-    for (double& v : document_.body_.values) v = reader_.readDouble();
-    return true;
+bool MnfReader::detectTopology() {
+	const auto& b = m_document.fileBytes;
+	const size_t nodeCount = m_document.nodes.size();
+	TopologyCandidate best;
+
+	// Connectivity records are: uint32 vertexCount, followed by vertexCount
+	// uint32 node indices. Accept line/triangle/quad records (2..4 indices)
+	// and require every index to be in range. This makes the parser independent
+	// of the element counts.
+	for (size_t off = 0; off + 12 <= b.size(); off += 4) {
+		const uint32_t firstCount = u32be(b, off);
+		if (firstCount < 2 || firstCount > 4 || off + 4ull + 4ull * firstCount > b.size()) continue;
+		size_t p = off, count = 0;
+		while (p + 4 <= b.size()) {
+			const uint32_t n = u32be(b, p);
+			if (n < 2 || n > 4 || p + 4ull + 4ull * n > b.size()) break;
+			bool valid = true;
+			for (uint32_t j = 0; j < n; ++j) {
+				const uint32_t idx = u32be(b, p + 4 + 4ull * j);
+				if (idx >= nodeCount) { valid = false; break; }
+			}
+			if (!valid) break;
+			p += 4 + 4ull * n;
+			++count;
+		}
+		if (count > best.count) best = { off, p, count };
+		// Once a substantial run has been decoded, its interior cannot be a
+		// longer run than the one starting at its first record. Skip its bytes
+		// to avoid quadratic rescanning of large connectivity blocks.
+		if (count >= 8) off = ((p - 1) / 4) * 4;
+	}
+	if (best.count < 8) return false;
+	m_document.topologyBlockOffset = best.offset;
+	m_document.topologyBlockEnd = best.end;
+
+	size_t p = best.offset;
+	m_document.elements.reserve(best.count);
+	while (p < best.end) {
+		const uint32_t n = u32be(b, p); p += 4;
+		MnfElement e;
+		e.indices.reserve(n);
+		for (uint32_t j = 0; j < n; ++j, p += 4) e.indices.push_back(u32be(b, p));
+		m_document.elements.push_back(std::move(e));
+	}
+	m_document.detectedBlocks.push_back({ "connectivity", best.offset, best.end - best.offset, best.count });
+	return true;
 }
 
-bool MnfReader::parseModes() {
-    constexpr uint64_t MODE_OFFSET = 340796;
-    constexpr uint32_t MODE_COUNT = 30;
-    reader_.seek(MODE_OFFSET);
-    document_.modeCount_ = MODE_COUNT;
-    document_.modes_.reserve(MODE_COUNT);
-
-    for (uint32_t i = 0; i < MODE_COUNT; ++i) {
-        MnfMode m;
-        m.id = reader_.readU32();
-        m.value0 = reader_.readDouble();
-        m.value1 = reader_.readDouble();
-        m.value2 = reader_.readDouble();
-        m.value3 = reader_.readDouble();
-        m.value4 = reader_.readDouble();
-        document_.modes_.push_back(m);
-    }
-    return true;
-}
-
-bool MnfReader::parseTopology() {
-    // Mixed connectivity block identified in swing_arm_0.mnf.
-    // Each record is: uint32 vertexCount, followed by vertexCount uint32 indices.
-    constexpr uint64_t TOPOLOGY_OFFSET = 17923724;
-    constexpr uint32_t EXPECTED_LINES = 323;
-    constexpr uint32_t EXPECTED_TRIANGLES = 53502;
-    constexpr uint32_t EXPECTED_QUADS = 8367;
-
-    reader_.seek(TOPOLOGY_OFFSET);
-    document_.lines_.reserve(EXPECTED_LINES);
-    document_.triangles_.reserve(EXPECTED_TRIANGLES);
-    document_.quads_.reserve(EXPECTED_QUADS);
-
-    for (uint32_t i = 0;
-         i < EXPECTED_LINES + EXPECTED_TRIANGLES + EXPECTED_QUADS;
-         ++i) {
-        const uint32_t count = reader_.readU32();
-        if (count == 2) {
-            MnfLine e;
-            e.count = count;
-            e.v0 = reader_.readU32();
-            e.v1 = reader_.readU32();
-            document_.lines_.push_back(e);
-        } else if (count == 3) {
-            MnfTriangle t;
-            t.count = count;
-            t.v0 = reader_.readU32();
-            t.v1 = reader_.readU32();
-            t.v2 = reader_.readU32();
-            document_.triangles_.push_back(t);
-        } else if (count == 4) {
-            MnfQuad q;
-            q.count = count;
-            q.v0 = reader_.readU32();
-            q.v1 = reader_.readU32();
-            q.v2 = reader_.readU32();
-            q.v3 = reader_.readU32();
-            document_.quads_.push_back(q);
-        } else {
-            std::cerr << "Unexpected connectivity record size " << count
-                      << " at record " << i << '\n';
-            return false;
-        }
-    }
-
-    if (document_.lines_.size() != EXPECTED_LINES ||
-        document_.triangles_.size() != EXPECTED_TRIANGLES ||
-        document_.quads_.size() != EXPECTED_QUADS) {
-        std::cerr << "Connectivity count mismatch: lines="
-                  << document_.lines_.size() << ", triangles="
-                  << document_.triangles_.size() << ", quads="
-                  << document_.quads_.size() << '\n';
-        return false;
-    }
-    return true;
-}
-
-bool MnfReader::parseEdgeLines() {
-    constexpr uint64_t NODE_OFFSET = 2588;
-    constexpr uint64_t BODY_OFFSET = 340688; // 与 parseBodyProperties 中的偏移保持一致
-    constexpr uint32_t NODE_RECORD_SIZE = 4 + 8 * 3; // id (u32) + x,y,z (double x3)
-
-    if (BODY_OFFSET <= NODE_OFFSET) {
-        std::cerr << "Invalid offsets for node region\n";
-        return false;
-    }
-
-    uint64_t blockSize = BODY_OFFSET - NODE_OFFSET;
-    if (blockSize % NODE_RECORD_SIZE != 0) {
-        std::cerr << "Warning: node block size is not an exact multiple of node record size\n";
-    }
-
-    uint32_t nodeCount = static_cast<uint32_t>(blockSize / NODE_RECORD_SIZE);
-
-    reader_.seek(NODE_OFFSET);
-    document_.nodes_.clear();
-    document_.nodes_.reserve(nodeCount);
-
-    for (uint32_t i = 0; i < nodeCount; ++i) {
-        MnfNode n;
-        n.id = reader_.readU32();
-        n.x = reader_.readDouble();
-        n.y = reader_.readDouble();
-        n.z = reader_.readDouble();
-        if (!validDouble(n.x) || !validDouble(n.y) || !validDouble(n.z)) {
-            std::cerr << "Invalid node at index " << i << '\n';
-            return false;
-        }
-        //else {
-        //	std::cout<<std::setw(16)<<n.id<<std::setw(16)<<n.x<<std::setw(16)<<n.y<<std::setw(16)<<n.z<<'\n';
-        //}
-        document_.nodes_.push_back(n);
-    }
-    return true;
+bool MnfReader::detectModes() {
+	const auto& b = m_document.fileBytes;
+	constexpr size_t stride = 44; // uint32 mode ID + five doubles
+	ModeCandidate best;
+	for (size_t off = 0; off + stride <= b.size(); off += 4) {
+		const uint32_t first = u32be(b, off);
+		if (first == 0 || first > 1000000) continue;
+		size_t p = off, count = 0;
+		uint32_t prev = first;
+		while (p + stride <= b.size()) {
+			const uint32_t id = u32be(b, p);
+			bool ok = id != 0 && (count == 0 || (prev != std::numeric_limits<uint32_t>::max() && id == prev + 1));
+			for (int k = 0; ok && k < 5; ++k) ok = plausibleDouble(f64be(b, p + 4 + 8ull * k));
+			if (!ok) break;
+			++count; prev = id; p += stride;
+		}
+		if (count > best.count) best = { off, count };
+	}
+	if (best.count < 2) return false;
+	// Avoid mistaking arbitrary numerical data for modes: a sequential-ID run
+	// must begin after the detected node block and before the connectivity block.
+	if (best.offset < m_document.nodeBlockOffset + m_document.nodes.size() * 28 ||
+		best.offset >= m_document.topologyBlockOffset) return false;
+	m_document.modes.reserve(best.count);
+	for (size_t i = 0, p = best.offset; i < best.count; ++i, p += stride) {
+		MnfMode mode; mode.id = u32be(b, p);
+		for (int k = 0; k < 5; ++k) mode.values[k] = f64be(b, p + 4 + 8ull * k);
+		m_document.modes.push_back(mode);
+	}
+	m_document.detectedBlocks.push_back({ "mode-like records (heuristic)", best.offset, best.count * stride, best.count });
+	return true;
 }
 
 bool MnfReader::exportOBJ(const std::string& filename) const {
-    std::ofstream out(filename);
-    if (!out) return false;
-
-    out << "# MNF converted OBJ\n";
-    out << "# Nodes: " << document_.nodes_.size() << "\n";
-    out << "# Lines: " << document_.lines_.size() << "\n";
-    out << "# Triangles: " << document_.triangles_.size() << "\n";
-    out << "# Quads: " << document_.quads_.size() << "\n\n";
-
-    for (const auto& n : document_.nodes_)
-        out << std::setprecision(17) << "v " << n.x << ' ' << n.y << ' ' << n.z << '\n';
-
-    // OBJ face indices are 1-based. The source connectivity indices are written
-    // as found; confirm index convention against the producer if rendering looks shifted.
-    out << '\n';
-    for (const auto& e : document_.lines_)
-        out << "l " << e.v0 << ' ' << e.v1 << '\n';
-    for (const auto& t : document_.triangles_)
-        out << "f " << t.v0 << ' ' << t.v1 << ' ' << t.v2 << '\n';
-    for (const auto& q : document_.quads_)
-        out << "f " << q.v0 << ' ' << q.v1 << ' ' << q.v2 << ' ' << q.v3 << '\n';
-    return true;
+	std::ofstream out(filename);
+	if (!out) return false;
+	out << "# MNF geometry export; source indices are assumed 0-based and converted to OBJ 1-based\n";
+	for (const auto& n : m_document.nodes)
+		out << std::setprecision(17) << "v " << n.x << ' ' << n.y << ' ' << n.z << '\n';
+	for (const auto& e : m_document.elements) {
+		if (e.indices.size() == 2) out << "l";
+		else out << "f";
+		for (uint32_t idx : e.indices) out << ' ' << (static_cast<uint64_t>(idx) + 1);
+		out << '\n';
+	}
+	return true;
 }
 
 bool MnfReader::exportNodesCSV(const std::string& filename) const {
-    std::ofstream out(filename);
-    if (!out) return false;
-    out << "Index,NodeID,X,Y,Z\n";
-    for (size_t i = 0; i < document_.nodes_.size(); ++i) {
-        const auto& n = document_.nodes_[i];
-        out << i << ',' << n.id << ',' << std::setprecision(17)
-            << n.x << ',' << n.y << ',' << n.z << '\n';
-    }
-    return true;
+	std::ofstream out(filename);
+	if (!out) return false;
+	out << "Index,NodeID,X,Y,Z\n";
+	for (size_t i = 0; i < m_document.nodes.size(); ++i) {
+		const auto& n = m_document.nodes[i];
+		out << i << ',' << n.id << ',' << std::setprecision(17) << n.x << ',' << n.y << ',' << n.z << '\n';
+	}
+	return true;
 }
 
 bool MnfReader::exportModesCSV(const std::string& filename) const {
-    std::ofstream out(filename);
-    if (!out) return false;
-    out << "Mode,Value0,Value1,Value2,Value3,Value4\n";
-    for (const auto& m : document_.modes_)
-        out << m.id << ',' << std::setprecision(17)
-            << m.value0 << ',' << m.value1 << ',' << m.value2 << ','
-            << m.value3 << ',' << m.value4 << '\n';
-    return true;
+	std::ofstream out(filename);
+	if (!out) return false;
+	out << "ModeID,Value0,Value1,Value2,Value3,Value4\n";
+	for (const auto& m : m_document.modes)
+		out << m.id << ',' << std::setprecision(17) << m.values[0] << ',' << m.values[1] << ','
+		<< m.values[2] << ',' << m.values[3] << ',' << m.values[4] << '\n';
+	return true;
+}
+
+bool MnfReader::exportDetectedBlocksCSV(const std::string& filename) const {
+	std::ofstream out(filename);
+	if (!out) return false;
+	out << "Kind,Offset,ByteSize,RecordCount\n";
+	for (const auto& block : m_document.detectedBlocks)
+		out << block.kind << ',' << block.offset << ',' << block.byteSize << ',' << block.recordCount << '\n';
+	return true;
 }
 
 void MnfReader::printSummary() const {
-    std::cout << "============================\n"
-              << "MNF File Summary\n"
-              << "============================\n"
-              << "File size      : " << document_.fileSize_ << " bytes\n"
-              << "Nodes          : " << document_.nodes_.size() << '\n'
-              << "Mixed-block lines     : " << document_.lines_.size() << '\n'
-              << "Triangles      : " << document_.triangles_.size() << '\n'
-              << "Quads          : " << document_.quads_.size() << '\n'
-              << "Separate edge lines : " << document_.edgeLines_.size() << '\n'
-              << "Modes          : " << document_.modeCount_ << '\n'
-              << "============================\n";
+	std::cout << "========================================================\nMNF structural scan summary\n========================================================\n"
+		<< "File size       : " << m_document.fileSize << " bytes\n"
+		<< "Node block      : offset " << m_document.nodeBlockOffset << "\n"
+		<< "Nodes           : " << m_document.nodes.size() << "\n"
+		<< "Connectivity    : offset " << m_document.topologyBlockOffset << " .. " << m_document.topologyBlockEnd << "\n"
+		<< "Elements        : " << m_document.elements.size() << "\n"
+		<< "Line records    : " << m_document.lineCount() << "\n"
+		<< "Triangles       : " << m_document.triangleCount() << "\n"
+		<< "Quads           : " << m_document.quadCount() << "\n"
+		<< "Other polygons  : " << m_document.polygonCount() << "\n"
+		<< "Mode-like rows  : " << m_document.modes.size() << " (heuristic)\n"
+		<< "========================================================\n";
 }
