@@ -1,10 +1,15 @@
 #include "mnf_parser.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <string>
@@ -68,13 +73,24 @@ namespace {
 		return sections.count("all") != 0 || sections.count(section) != 0;
 	}
 
+	double ReadFloat64BigEndianForExport(const std::vector<uint8_t>& bytes,
+		size_t position) {
+		uint64_t bits = 0;
+		for (size_t i = 0; i < sizeof(bits); ++i) {
+			bits = (bits << 8) | bytes[position + i];
+		}
+		double value = 0.0;
+		std::memcpy(&value, &bits, sizeof(value));
+		return value;
+	}
+
 }  // namespace
 
 void PrintHelp() {
 	std::cout <<
 		"MNF Universal Inspection Tool (C++17)\n"
 		"Usage: mnf_tool <input.mnf> [--out DIR] [--sections LIST]\n\n"
-		"Sections: all,header,units,nodes,connectivity,mass-inertia,mode-metadata,mode-shapes,raw-blocks,obj,report\n"
+		"Sections: all,header,units,nodes,connectivity,mass-inertia,mode-metadata,mode-shapes,matrix-candidates,strings,raw-blocks,obj,report\n"
 		"Examples:\n"
 		"  mnf_tool part.mnf --out out\n"
 		"  mnf_tool part.mnf --out out --sections nodes,connectivity,obj,report\n"
@@ -100,12 +116,87 @@ int main(int argc, char** argv) {
 		saveBytes("prefix_unclassified.bin", 0, d.node_offset);
 		WriteHex(out / "prefix_hex.txt", d.bytes, 0, d.node_offset);
 		std::ofstream h(out / "header_info.json");
-		h << "{\n  \"input\":\"" << JsonEscape(input) << "\",\n  \"file_size_bytes\":" << d.file_size << ",\n  \"prefix_region_bytes\":" << d.node_offset << ",\n  \"interpretation\":\"Raw prefix preserved. The prefix is not assumed to be a fully decoded header because this MNF binary layout is undocumented.\"\n}\n";
+		h << "{\n  \"input\": \"" << JsonEscape(input)
+			<< "\",\n  \"file_size_bytes\": " << d.file_size
+			<< ",\n  \"prefix_region_bytes\": " << d.node_offset
+			<< ",\n  \"status\": \"raw prefix preserved; semantic header fields are not validated\"\n}\n";
 	}
 	if (HasSection(sections, "units")) {
-		std::ofstream u(out / "units.json");
-		u << "{\n  \"status\":\"not_semantically_decoded\",\n  \"reason\":\"No validated unit-field schema is available for the supplied binary layout. Raw prefix and opaque regions are preserved.\",\n  \"possible_ascii_unit_tokens\":[]\n}\n";
+		const std::vector<std::string> unit_tokens = {
+			"mm", "cm", "in", "ft", "kg", "tonne", "kN", "lbf",
+			"MPa", "Pa", "ms", "rad", "deg", "meter", "metre",
+			"kilogram", "newton", "second" };
+		std::set<std::string> candidates;
+		const std::regex token_pattern_cache(
+			"(^|[^A-Za-z])(mm|cm|in|ft|kg|tonne|kN|lbf|MPa|Pa|ms|rad|deg|meter|metre|kilogram|newton|second)($|[^A-Za-z])",
+			std::regex::icase);
+		for (const auto& run : d.text_runs) {
+			// Unit labels are most likely in the prefix/header. Do not scan
+			// random printable runs throughout large numeric payloads.
+			if (run.offset >= d.node_offset) continue;
+			std::smatch match;
+			if (std::regex_search(run.text, match, token_pattern_cache)) {
+				std::string candidate = match.str(2);
+				for (const auto& token : unit_tokens) {
+					if (candidate.size() == token.size() &&
+						std::equal(candidate.begin(), candidate.end(),
+							token.begin(), [](char left, char right) {
+								return std::tolower(static_cast<unsigned char>(left)) ==
+									std::tolower(static_cast<unsigned char>(right));
+							})) {
+						candidates.insert(token);
+					}
+				}
+			}
+		}
+		std::ofstream units_file(out / "units.json");
+		units_file << "{\n  \"status\": \"candidate_scan_only\",\n"
+			<< "  \"recognized_tokens\": [";
+		bool first_token = true;
+		for (const auto& token : candidates) {
+			if (!first_token) units_file << ", ";
+			units_file << "\"" << JsonEscape(token) << "\"";
+			first_token = false;
+		}
+		units_file << "],\n  \"warning\": \"Text-token matches are not proof of unit metadata; no unit is asserted unless a producer-specific schema validates it.\"\n}\n";
 	}
+	if (HasSection(sections, "strings")) {
+		std::ofstream strings_file(out / "printable_strings.csv");
+		strings_file << "offset,text\n";
+		for (const auto& run : d.text_runs) {
+			strings_file << run.offset << ",\"";
+			for (char character : run.text) {
+				if (character == '"') strings_file << "\"\"";
+				else strings_file << character;
+			}
+			strings_file << "\"\n";
+		}
+	}
+	if (HasSection(sections, "matrix-candidates")) {
+		std::ofstream matrix_file(out / "matrix_candidates.csv");
+		matrix_file << "region,offset,end_offset,byte_size,aligned_double_count,finite_double_count,classification\n";
+		for (const auto& range : d.ranges) {
+			const uint64_t size = range.end - range.begin;
+			const uint64_t count = size / sizeof(double);
+			if (count < 4) continue;
+			uint64_t finite_count = 0;
+			const uint64_t sample_count = std::min<uint64_t>(count, 256);
+			for (uint64_t i = 0; i < sample_count; ++i) {
+				const double value = ReadFloat64BigEndianForExport(
+					d.bytes, static_cast<size_t>(range.begin + i * sizeof(double)));
+				if (std::isfinite(value)) ++finite_count;
+			}
+			const double ratio = sample_count == 0 ? 0.0 :
+				static_cast<double>(finite_count) / static_cast<double>(sample_count);
+			if (ratio >= 0.95) {
+				matrix_file << range.name << ',' << range.begin << ','
+					<< range.end << ',' << size << ',' << count << ','
+					<< finite_count
+					<< ",\"numeric block candidate only; first 256 doubles sampled; dimensions and physical meaning unknown\"\n";
+			}
+		}
+	}
+
 	if (HasSection(sections, "nodes")) {
 		std::ofstream f(out / "nodes.csv"); f << "record_index,node_id,x,y,z\n" << std::setprecision(17);
 		for (size_t i = 0; i < d.nodes.size(); ++i) { auto& n = d.nodes[i]; f << i << ',' << n.id << ',' << n.x << ',' << n.y << ',' << n.z << '\n'; }
@@ -115,7 +206,7 @@ int main(int argc, char** argv) {
 		for (size_t i = 0; i < d.elements.size(); ++i) { f << i << ',' << d.elements[i].indices.size() << ",\""; for (size_t j = 0; j < d.elements[i].indices.size(); ++j) { if (j)f << ' '; f << d.elements[i].indices[j]; }f << "\"\n"; }
 	}
 	if (HasSection(sections, "mass-inertia") && d.body_properties_found) {
-		std::ofstream f(out / "mass_inertia.csv"); f << "field,value\n" << std::setprecision(17);
+		std::ofstream f(out / "body_properties_candidate.csv"); f << "candidate_field,value\n" << std::setprecision(17);
 		f << "mass," << d.body[0] << "\ncenter_of_mass_x," << d.body[1] << "\ncenter_of_mass_y," << d.body[2] << "\ncenter_of_mass_z," << d.body[3] << "\n";
 		f << "inertia_xx," << d.body[4] << "\ninertia_xy," << d.body[5] << "\ninertia_xz," << d.body[6] << "\ninertia_yx," << d.body[7] << "\ninertia_yy," << d.body[8] << "\ninertia_yz," << d.body[9] << "\ninertia_zx," << d.body[10] << "\ninertia_zy," << d.body[11] << "\ninertia_zz," << d.body[12] << "\n";
 	}
@@ -148,7 +239,7 @@ int main(int argc, char** argv) {
 		f << "  \"connectivity\":{\"found\":" << (d.topology_found ? "true" : "false") << ",\"offset\":" << d.topology_offset << ",\"count\":" << d.elements.size() << ",\"end_offset\":" << d.topology_end << ",\"lines\":" << d.LineCount() << ",\"triangles\":" << d.TriangleCount() << ",\"quads\":" << d.QuadCount() << ",\"polygons_gt4\":" << d.PolygonCount() << "},\n";
 		f << "  \"body_mass_inertia\":{\"recognized\":" << (d.body_properties_found ? "true" : "false") << ",\"schema\":\"13 doubles: mass, COM xyz, 3x3 inertia tensor; inferred from two sample files\"},\n";
 		f << "  \"mode_parameter_rows\":{\"recognized\":" << (d.modes_found ? "true" : "false") << ",\"offset\":" << d.mode_offset << ",\"count\":" << d.mode_rows.size() << ",\"end_offset\":" << d.mode_end << ",\"schema\":\"ID + five doubles; field meanings not asserted\"},\n";
-		f << "  \"limitations\":[\"Units/header semantics are not fully decoded.\",\"Modal-shape region is preserved raw, not semantically decoded.\",\"Generalized mass/stiffness matrices and other undocumented blocks are not interpreted.\",\"Connectivity indices are treated as zero-based for OBJ export; validate against producer documentation.\"],\n";
+		f << "  \"limitations\":[\"Header and unit semantics are not fully decoded; see raw prefix and printable-string scan.\",\"Modal-shape region is preserved raw, not semantically decoded.\",\"Generalized mass/stiffness matrices and other undocumented blocks are not interpreted.\",\"Numeric matrix candidates are only heuristic regions, not confirmed matrices.\",\"Connectivity indices are treated as zero-based for OBJ export; validate against producer documentation.\"],\n";
 		f << "  \"opaque_regions\":[";
 		for (size_t i = 0; i < d.ranges.size(); ++i) { auto& r = d.ranges[i]; if (i)f << ','; f << "{\"name\":\"" << r.name << "\",\"offset\":" << r.begin << ",\"end_offset\":" << r.end << ",\"byte_size\":" << (r.end - r.begin) << "}"; }
 		f << "]\n}\n";
@@ -160,6 +251,6 @@ int main(int argc, char** argv) {
 	std::cout << "Body mass/inertia: " << (d.body_properties_found ? "recognized (13 doubles)" : "not recognized") << "\n";
 	std::cout << "Mode parameter rows: " << d.mode_rows.size() << " (heuristic; not full mode shapes)\n";
 	std::cout << "Output: " << fs::absolute(out).string() << "\n";
-	std::cout << "Important: raw preservation is complete when --sections raw-blocks is selected; semantic decoding is limited to validated/inferred structures.\n";
+	std::cout << "Important: raw preservation is complete when --sections raw-blocks is selected. Matrix candidates and printable strings are forensic hints, not semantic proof.\n";
 	return 0;
 }

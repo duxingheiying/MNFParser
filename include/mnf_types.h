@@ -22,6 +22,11 @@ struct MnfModeRow {
 	double values[5] = {};
 };
 
+struct MnfTextRun {
+	uint64_t offset = 0;
+	std::string text;
+};
+
 struct MnfRange {
 	std::string name;
 	uint64_t begin = 0;
@@ -49,6 +54,7 @@ struct MnfDocument {
 	std::vector<MnfModeRow> mode_rows;
 	double body[13] = {};
 	std::vector<MnfRange> ranges;
+	std::vector<MnfTextRun> text_runs;
 	std::string warnings;
 
 	size_t LineCount() const;

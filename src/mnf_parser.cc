@@ -8,7 +8,6 @@
 #include <utility>
 
 namespace {
-
 	uint32_t ReadUint32BigEndian(const std::vector<uint8_t>& bytes,
 		size_t position) {
 		return (uint32_t(bytes[position]) << 24) |
@@ -95,47 +94,17 @@ bool MnfParser::Load(const std::string& path, MnfDocument& document) {
 
 	if (!DetectNodes(document)) {
 		document.warnings =
-			"No reliable node-coordinate block found (expected BE uint32 ID + "
-			"3 BE float64 values)";
-		return false;
+			"No node block matched the current sample-derived profile. "
+			"The file will still be inspected and preserved as raw data.";
 	}
 
 	DetectTopology(document);
-	DetectBodyAndModes(document);
-
-	// Preserve every byte range, including regions not semantically decoded.
-	std::vector<std::pair<uint64_t, uint64_t>> used_ranges;
-	used_ranges.push_back({ document.node_offset, document.node_end });
-	if (document.topology_found) {
-		used_ranges.push_back(
-			{ document.topology_offset, document.topology_end });
-	}
-	if (document.body_properties_found) {
-		used_ranges.push_back({ document.node_end, document.node_end + 104 });
-	}
-	if (document.modes_found) {
-		used_ranges.push_back({ document.mode_offset, document.mode_end });
+	if (document.nodes_found) {
+		DetectBodyAndModes(document);
 	}
 
-	std::sort(used_ranges.begin(), used_ranges.end());
-	uint64_t current_offset = 0;
-	size_t opaque_index = 0;
-	for (const auto& range : used_ranges) {
-		if (range.first > current_offset) {
-			document.ranges.push_back(
-				{ "opaque_" + std::to_string(opaque_index++), current_offset,
-				 range.first, 0, "unclassified raw bytes" });
-		}
-		if (range.second > current_offset) {
-			current_offset = range.second;
-		}
-	}
-
-	if (current_offset < document.file_size) {
-		document.ranges.push_back(
-			{ "opaque_" + std::to_string(opaque_index), current_offset,
-			 document.file_size, 0, "unclassified raw bytes" });
-	}
+	ScanPrintableStrings(document);
+	BuildOpaqueRanges(document);
 	return true;
 }
 
@@ -271,6 +240,9 @@ bool MnfParser::DetectTopology(MnfDocument& document) {
 }
 
 bool MnfParser::DetectBodyAndModes(MnfDocument& document) {
+	if (!document.nodes_found) {
+		return false;
+	}
 	const auto& bytes = document.bytes;
 	constexpr uint64_t kBodyPropertySize = 13 * sizeof(double);
 
@@ -361,4 +333,69 @@ bool MnfParser::DetectBodyAndModes(MnfDocument& document) {
 		document.mode_rows.push_back(row);
 	}
 	return true;
+}
+
+
+void MnfParser::ScanPrintableStrings(MnfDocument& document) {
+	constexpr size_t kMinimumTextLength = 4;
+	const auto& bytes = document.bytes;
+	size_t start = 0;
+	while (start < bytes.size()) {
+		while (start < bytes.size() &&
+			(bytes[start] < 0x20 || bytes[start] > 0x7e)) {
+			++start;
+		}
+		size_t end = start;
+		while (end < bytes.size() && bytes[end] >= 0x20 && bytes[end] <= 0x7e) {
+			++end;
+		}
+		if (end - start >= kMinimumTextLength) {
+			document.text_runs.push_back(
+				{ static_cast<uint64_t>(start),
+				 std::string(bytes.begin() + start, bytes.begin() + end) });
+		}
+		start = end + (end == start ? 1 : 0);
+	}
+}
+
+void MnfParser::BuildOpaqueRanges(MnfDocument& document) {
+	// These ranges are recognized by sample-derived heuristics, not a complete
+	// vendor schema. Opaque ranges preserve everything outside them verbatim.
+	std::vector<std::pair<uint64_t, uint64_t>> known_ranges;
+	if (document.nodes_found) {
+		known_ranges.push_back({ document.node_offset, document.node_end });
+	}
+	if (document.body_properties_found) {
+		known_ranges.push_back(
+			{ document.node_end, document.node_end + 13 * sizeof(double) });
+	}
+	if (document.modes_found) {
+		known_ranges.push_back({ document.mode_offset, document.mode_end });
+	}
+	if (document.topology_found) {
+		known_ranges.push_back(
+			{ document.topology_offset, document.topology_end });
+	}
+
+	for (auto& range : known_ranges) {
+		range.first = std::min<uint64_t>(range.first, document.file_size);
+		range.second = std::min<uint64_t>(range.second, document.file_size);
+	}
+	std::sort(known_ranges.begin(), known_ranges.end());
+
+	uint64_t current_offset = 0;
+	size_t opaque_index = 0;
+	for (const auto& range : known_ranges) {
+		if (range.first > current_offset) {
+			document.ranges.push_back(
+				{ "opaque_" + std::to_string(opaque_index++), current_offset,
+				 range.first, 0, "unclassified raw bytes; semantic type unknown" });
+		}
+		current_offset = std::max(current_offset, range.second);
+	}
+	if (current_offset < document.file_size) {
+		document.ranges.push_back(
+			{ "opaque_" + std::to_string(opaque_index), current_offset,
+			 document.file_size, 0, "unclassified raw bytes; semantic type unknown" });
+	}
 }

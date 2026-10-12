@@ -15,6 +15,8 @@ private:
 	bool DetectNodes(MnfDocument& document);
 	bool DetectTopology(MnfDocument& document);
 	bool DetectBodyAndModes(MnfDocument& document);
+	void ScanPrintableStrings(MnfDocument& document);
+	void BuildOpaqueRanges(MnfDocument& document);
 };
 
 #endif  // MNF_UNIVERSAL_TOOL_INCLUDE_MNF_PARSER_H_
