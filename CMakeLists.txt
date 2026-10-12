@@ -1,20 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
-project(MNFParser LANGUAGES CXX)
+project(MNFUniversalTool LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(mnf_parser
-    src/main.cpp
-    src/MnfReader.cpp
-    src/BigEndianReader.cpp
+add_executable(mnf_tool
+  src/main.cc
+  src/mnf_parser.cc
 )
 
-target_include_directories(mnf_parser PRIVATE include)
+target_include_directories(mnf_tool PRIVATE include)
 
-if (MSVC)
-    target_compile_options(mnf_parser PRIVATE /W4)
+if(MSVC)
+  target_compile_options(mnf_tool PRIVATE /W4 /permissive-)
 else()
-    target_compile_options(mnf_parser PRIVATE -Wall -Wextra -Wpedantic)
+  target_compile_options(mnf_tool PRIVATE -Wall -Wextra -Wpedantic)
 endif()
