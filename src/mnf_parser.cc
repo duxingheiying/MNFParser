@@ -110,7 +110,7 @@ bool MnfParser::Load(const std::string& path, MnfDocument& document) {
 
 bool MnfParser::DetectNodes(MnfDocument& document) {
 	const auto& bytes = document.bytes;
-	constexpr size_t kNodeRecordSize = 28;
+	constexpr size_t kNodeRecordSize = 28; // 4 bytes for ID + 3 doubles (8 bytes each) for x, y, z 
 	size_t best_offset = 0;
 	size_t best_count = 0;
 
@@ -256,12 +256,9 @@ bool MnfParser::DetectBodyAndModes(MnfDocument& document) {
 			valid_record = valid_record && IsPlausibleNumber(values[index]);
 		}
 
-		const double tolerance =
-			1.0e-6 * std::max(1.0, std::abs(values[5]));
-		const double tolerance_xz =
-			1.0e-6 * std::max(1.0, std::abs(values[6]));
-		const double tolerance_yz =
-			1.0e-6 * std::max(1.0, std::abs(values[9]));
+		const double tolerance = 1.0e-6 * std::max(1.0, std::abs(values[5]));
+		const double tolerance_xz = 1.0e-6 * std::max(1.0, std::abs(values[6]));
+		const double tolerance_yz = 1.0e-6 * std::max(1.0, std::abs(values[9]));
 		if (valid_record && std::abs(values[5] - values[7]) < tolerance &&
 			std::abs(values[6] - values[10]) < tolerance_xz &&
 			std::abs(values[9] - values[11]) < tolerance_yz) {
@@ -278,12 +275,11 @@ bool MnfParser::DetectBodyAndModes(MnfDocument& document) {
 	const uint64_t end_limit = document.topology_found
 		? document.topology_offset
 		: document.file_size;
-	constexpr uint64_t kModeRecordSize = 44;
+	constexpr uint64_t kModeRecordSize = 44; // 4 bytes for ID + 6 doubles (8 bytes each) for dx, dy, dz, ax, ay, az
 	size_t best_offset = 0;
 	size_t best_count = 0;
 
-	for (uint64_t offset = start;
-		offset + kModeRecordSize <= end_limit; offset += 4) {
+	for (uint64_t offset = start; offset + kModeRecordSize <= end_limit; offset += 4) {
 		const uint32_t first_id = ReadUint32BigEndian(bytes, offset);
 		if (first_id == 0 || first_id > 1000000) {
 			continue;
@@ -297,8 +293,7 @@ bool MnfParser::DetectBodyAndModes(MnfDocument& document) {
 			bool valid_record = mode_id != 0 &&
 				(count == 0 || mode_id == previous_id + 1);
 			for (int index = 0; valid_record && index < 5; ++index) {
-				valid_record = IsPlausibleNumber(
-					ReadFloat64BigEndian(bytes, position + 4 + 8ull * index));
+				valid_record = IsPlausibleNumber(ReadFloat64BigEndian(bytes, position + 4 + 8ull * index));
 			}
 			if (!valid_record) {
 				break;
@@ -322,19 +317,16 @@ bool MnfParser::DetectBodyAndModes(MnfDocument& document) {
 	document.mode_offset = best_offset;
 	document.mode_end = best_offset + best_count * kModeRecordSize;
 	document.modes_found = true;
-	for (size_t index = 0, position = best_offset; index < best_count;
-		++index, position += kModeRecordSize) {
+	for (size_t index = 0, position = best_offset; index < best_count; ++index, position += kModeRecordSize) {
 		MnfModeRow row;
 		row.id = ReadUint32BigEndian(bytes, position);
 		for (int value_index = 0; value_index < 5; ++value_index) {
-			row.values[value_index] =
-				ReadFloat64BigEndian(bytes, position + 4 + 8ull * value_index);
+			row.values[value_index] = ReadFloat64BigEndian(bytes, position + 4 + 8ull * value_index);
 		}
 		document.mode_rows.push_back(row);
 	}
 	return true;
 }
-
 
 void MnfParser::ScanPrintableStrings(MnfDocument& document) {
 	constexpr size_t kMinimumTextLength = 4;

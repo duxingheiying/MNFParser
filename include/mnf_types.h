@@ -13,6 +13,10 @@ struct MnfNode {
 	double z = 0.0;
 };
 
+struct MnfMadol
+{
+};
+
 struct MnfElement {
 	std::vector<uint32_t> indices;
 };
